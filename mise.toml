@@ -1,0 +1,199 @@
+# mise tasks for building this project.
+#   https://mise.jdx.dev
+#
+# Everything here is a thin wrapper around the Makefile -- `make <target>` always
+# works too. mise just gives you the whole setup as one command and remembers to
+# use a sensible job count.
+#
+# agbcc must be a SIBLING of this repo, because its installer is invoked as
+# `./install.sh ../pokefirered`:
+#
+#   decomp/
+#   |-- agbcc/         <- https://github.com/pret/agbcc
+#   `-- pokefirered/   <- this repo
+#
+# Run `mise tasks ls` to see everything. `mise run doctor` is the one to run first
+# if something is broken.
+
+[settings]
+# Don't saturate every core and spin the fans to max. Override per-run with
+# `make -j8`, or raise `jobs` here.
+jobs = 4
+
+[env]
+# Applies -j4 to every plain `make`, including the recursive $(MAKE) calls the
+# Makefile uses for its `firered_switch`-style target aliases.
+MAKEFLAGS = "-j4"
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+# These are OS packages, not mise-managed tools -- mise has no pacman backend.
+# Everything else in this file assumes they are present. On Debian/Ubuntu the
+# equivalent list is: build-essential git libpng-dev perl binutils-arm-none-eabi
+#
+#   base-devel              -> gcc, g++, make, binutils (host C toolchain; agbcc
+#                              is itself built with this, and the Makefile uses
+#                              `$(CC) -E` to preprocess .c files)
+#   arm-none-eabi-binutils  -> arm-none-eabi-{as,ld,objcopy,objdump}; assembles
+#                              and links the GBA ROM. Required, no substitute.
+#   libpng                  -> the repo's graphics tools (gbagfx) link against it
+#   perl                    -> used by the `syms` target
+#   git
+#
+# NOT needed: arm-none-eabi-gcc. That is devkitARM, only for `make modern`.
+
+[tasks.deps]
+description = "Install system packages needed to build (needs sudo)"
+run = """
+sudo pacman -S --needed \
+  base-devel \
+  arm-none-eabi-binutils \
+  libpng \
+  perl \
+  git
+"""
+
+[tasks.modern-deps]
+description = "Optional: install devkitARM, only needed for `make modern` (needs sudo)"
+run = """
+sudo pacman -S --needed arm-none-eabi-gcc
+"""
+
+# ---------------------------------------------------------------------------
+# Checking / troubleshooting
+# ---------------------------------------------------------------------------
+
+[tasks.doctor]
+description = "Verify the toolchain and the agbcc install look sane"
+run = """
+set -eu
+fail=0
+for t in gcc g++ make cpp git perl arm-none-eabi-as arm-none-eabi-ld arm-none-eabi-objcopy; do
+  if command -v "$t" >/dev/null 2>&1; then
+    printf '  ok   %s\\n' "$t"
+  else
+    printf '  MISS %s   <- mise run deps\\n' "$t"
+    fail=1
+  fi
+done
+if pkg-config --exists libpng 2>/dev/null; then
+  printf '  ok   libpng %s\\n' "$(pkg-config --modversion libpng)"
+else
+  printf '  MISS libpng   <- mise run deps\\n'
+  fail=1
+fi
+if [ -x tools/agbcc/bin/agbcc ]; then
+  printf '  ok   agbcc installed\\n'
+else
+  printf '  MISS agbcc   <- mise run agbcc:install\\n'
+  fail=1
+fi
+exit $fail
+"""
+
+# ---------------------------------------------------------------------------
+# agbcc -- build the compiler that matches the original ROM byte-for-byte
+# ---------------------------------------------------------------------------
+
+[tasks.agbcc]
+description = "Build agbcc from source (first time, and after changing agbcc)"
+dir = "{{config_root}}/../agbcc"
+run = "./build.sh"
+
+[tasks."agbcc:install"]
+description = "Install the built agbcc into this repo"
+depends = ["agbcc"]
+dir = "{{config_root}}/../agbcc"
+run = "./install.sh ../pokefirered"
+
+[tasks."agbcc:clean"]
+description = "Delete agbcc build artifacts so the next build is from scratch"
+dir = "{{config_root}}/../agbcc"
+run = """
+git clean -fX
+"""
+
+[tasks.setup]
+description = "First-time setup: system deps, then build+install agbcc"
+depends = ["deps", "agbcc:install"]
+
+# ---------------------------------------------------------------------------
+# Building ROMs
+# ---------------------------------------------------------------------------
+# The Makefile writes each ROM to this directory as poke<target>.gba. There is no
+# baserom.gba needed to build; the <target>.sha1 files are what `build` checks the
+# result against.
+#
+#   mise run build              all six ROMs
+#   mise run build:firered      just one
+#   mise run build -- -n        not supported; use `make -n firered` to preview
+#
+# Once you start editing, a ROM legitimately stops matching its .sha1. That is
+# information, not an error, so `build` reports it and still exits 0.
+
+[tasks.build]
+description = "Build all six ROMs and report retail match status"
+run = """
+set -eu
+for rom in firered firered_rev1 firered_switch leafgreen leafgreen_rev1 leafgreen_switch; do
+  make "$rom"
+done
+echo
+printf '%-26s %-17s %s\\n' ROM SHA1 STATUS
+printf '%-26s %-17s %s\\n' -------------------------- ----------------- ------------------------
+for rom in firered firered_rev1 firered_switch leafgreen leafgreen_rev1 leafgreen_switch; do
+  f="poke$rom.gba"
+  if [ ! -f "$f" ]; then
+    continue
+  fi
+  sum=$(sha1sum "$f" | cut -d' ' -f1)
+  if [ -f "$rom.sha1" ] && sha1sum -c "$rom.sha1" >/dev/null 2>&1; then
+    rom_status="matches retail"
+  else
+    rom_status="modified (not retail)"
+  fi
+  printf '%-26s %-17s %s\n' "$f" "$(printf '%s' "$sum" | cut -c1-16)" "$rom_status"
+done
+"""
+
+[tasks."build:firered"]
+description = "Build only firered (v1.0)"
+run = "make firered"
+
+[tasks."build:firered_rev1"]
+description = "Build only firered_rev1 (v1.1)"
+run = "make firered_rev1"
+
+[tasks."build:firered_switch"]
+description = "Build only firered_switch (rev 0xA)"
+run = "make firered_switch"
+
+[tasks."build:leafgreen"]
+description = "Build only leafgreen (v1.0)"
+run = "make leafgreen"
+
+[tasks."build:leafgreen_rev1"]
+description = "Build only leafgreen_rev1 (v1.1)"
+run = "make leafgreen_rev1"
+
+[tasks."build:leafgreen_switch"]
+description = "Build only leafgreen_switch (rev 0xA)"
+run = "make leafgreen_switch"
+
+[tasks.syms]
+description = "Dump pokefirered.sym -- symbol name/address list, handy when hacking"
+run = "make syms"
+
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+[tasks.clean]
+description = "Remove build output and all generated assets"
+run = "make clean"
+
+[tasks."clean:all"]
+description = "clean the decomp build and reset agbcc's artifacts"
+depends = ["clean", "agbcc:clean"]
+run = ""
